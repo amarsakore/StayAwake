@@ -1,4 +1,4 @@
-# Stay Awake Tile
+# Stay Awake
 
 A Quick Settings tile for Android that keeps your screen from turning off.
 
