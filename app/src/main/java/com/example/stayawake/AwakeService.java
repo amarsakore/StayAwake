@@ -9,14 +9,26 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.graphics.PixelFormat;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
+import android.provider.Settings;
 import android.service.quicksettings.TileService;
+import android.util.Log;
+import android.view.Gravity;
+import android.view.View;
+import android.view.WindowManager;
 
 /**
- * While this service runs, the screen stays on. Start it to turn stay-awake on,
- * stop it to turn it off. Runs in the foreground so the system doesn't kill it.
+ * While this service runs, the screen stays on.
+ *
+ * Main mechanism: an invisible 1x1 overlay window with FLAG_KEEP_SCREEN_ON. The
+ * window manager honours that flag on every ROM (it's what video players use).
+ * A screen wake lock is also held as a backup, but ColorOS and some other ROMs
+ * don't reliably honour wake locks from background apps.
+ *
+ * Runs as a foreground service so the system keeps the process alive.
  */
 public class AwakeService extends Service {
     static final String ACTION_STOP = "com.example.stayawake.STOP";
@@ -24,8 +36,11 @@ public class AwakeService extends Service {
     private static volatile boolean running;
 
     private PowerManager.WakeLock lock;
+    private View overlay;
 
     static boolean isRunning() { return running; }
+
+    static boolean canOverlay(Context c) { return Settings.canDrawOverlays(c); }
 
     static void start(Context c) {
         c.startForegroundService(new Intent(c, AwakeService.class));
@@ -36,19 +51,14 @@ public class AwakeService extends Service {
     }
 
     @Override
-    @SuppressWarnings("deprecation") // SCREEN_BRIGHT_WAKE_LOCK: deprecated but the only way without a window
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && ACTION_STOP.equals(intent.getAction())) {
             stopSelf();
             return START_NOT_STICKY;
         }
         goForeground();
-        if (lock == null) {
-            PowerManager pm = getSystemService(PowerManager.class);
-            lock = pm.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK
-                    | PowerManager.ON_AFTER_RELEASE, "StayAwake:screen");
-            lock.acquire();
-        }
+        addOverlay();
+        acquireLock();
         running = true;
         refreshTile();
         return START_STICKY;
@@ -57,10 +67,49 @@ public class AwakeService extends Service {
     @Override
     public void onDestroy() {
         running = false;
+        removeOverlay();
         if (lock != null && lock.isHeld()) lock.release();
         lock = null;
         refreshTile();
         super.onDestroy();
+    }
+
+    private void addOverlay() {
+        if (overlay != null || !canOverlay(this)) return;
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                1, 1,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                        | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT);
+        lp.gravity = Gravity.TOP | Gravity.START;
+        lp.setTitle("StayAwake");
+        View v = new View(this);
+        try {
+            getSystemService(WindowManager.class).addView(v, lp);
+            overlay = v;
+        } catch (RuntimeException e) {
+            Log.w("StayAwake", "could not add keep-screen-on window", e);
+        }
+    }
+
+    private void removeOverlay() {
+        if (overlay == null) return;
+        try {
+            getSystemService(WindowManager.class).removeView(overlay);
+        } catch (RuntimeException ignored) { }
+        overlay = null;
+    }
+
+    @SuppressWarnings("deprecation") // SCREEN_BRIGHT_WAKE_LOCK: backup only
+    private void acquireLock() {
+        if (lock != null) return;
+        lock = getSystemService(PowerManager.class).newWakeLock(
+                PowerManager.SCREEN_BRIGHT_WAKE_LOCK | PowerManager.ON_AFTER_RELEASE,
+                "StayAwake:screen");
+        lock.acquire();
     }
 
     private void refreshTile() {
